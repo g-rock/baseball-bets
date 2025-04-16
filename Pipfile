@@ -9,6 +9,7 @@ flask = "*"
 mlb-statsapi = "*"
 requests = "*"
 python-dotenv = "*"
+google-cloud-storage = "*"
 
 [dev-packages]
 
