@@ -5,16 +5,15 @@ import logging
 import json
 import os
 from dotenv import load_dotenv
-from datetime import date, timedelta
+from datetime import date
 from google.cloud import storage
 from flask import jsonify, make_response
 
 load_dotenv()
 api_key = os.getenv("ODDS_API_KEY")
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 def get_team_rankings(ranking_date):
-    logging.info(f"Fetching rankings for date: {ranking_date}")
     year, month, day = ranking_date.split('-')
     standings = statsapi.standings_data(leagueId='103,104', season=int(year), date=ranking_date)
     teams = [
@@ -35,14 +34,11 @@ def get_team_rankings(ranking_date):
     }
 
 def get_all_game_odds(odds_date):
-    logging.info(f"Fetching game odds for date: {odds_date}")
     url = (
         f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
         f"?apiKey={api_key}&regions=us&markets=h2h"
         f"&commenceTimeFrom={odds_date}T00:00:00Z"
-        f"&commenceTimeTo={odds_date}T23:59:59Z"
     )
-    logging.info(url)
     response = requests.get(url)
     return response.json() if response.status_code == 200 else []
 
@@ -51,6 +47,29 @@ def filter_odds_for_team(odds_data, home_team):
         if game.get("home_team") == home_team:
             return game.get("bookmakers", [])
     return []
+
+def get_pitcher_stats(pitcher_name):
+    pitcher_lookup = statsapi.lookup_player(pitcher_name)
+    if pitcher_lookup:
+        pitcher_id = pitcher_lookup[0]['id']
+        stats_data = statsapi.player_stat_data(pitcher_id, group="[pitching]", type="season")
+        if isinstance(stats_data, dict) and 'stats' in stats_data:
+            stat_list = stats_data['stats']
+            if stat_list:
+                stats = stat_list[0].get('stats', {})
+                return {
+                    "name": pitcher_name,
+                    "era": stats.get('era'),
+                    "inningsPitched": stats.get('inningsPitched')
+                }
+        logging.warning(f"No valid season stats for {pitcher_name}")
+    else:
+        logging.warning(f"Pitcher not found: {pitcher_name}")
+    return {
+        "name": pitcher_name,
+        "era": None,
+        "inningsPitched": None
+    }
 
 def check_matchups(schedule_date, ranking_date, odds_date):
     rankings = get_team_rankings(ranking_date)
@@ -61,6 +80,9 @@ def check_matchups(schedule_date, ranking_date, odds_date):
 
     for game in schedule:
         home_team, away_team = game["home_name"], game["away_name"]
+        home_probable_pitcher, away_probable_pitcher = game["home_probable_pitcher"], game["away_probable_pitcher"]
+        home_pitcher_stats = get_pitcher_stats(home_probable_pitcher)
+        away_pitcher_stats = get_pitcher_stats(away_probable_pitcher)
         if (home_team, away_team) in matchups or (away_team, home_team) in matchups:
             continue
         matchups.add((home_team, away_team))
@@ -79,8 +101,10 @@ def check_matchups(schedule_date, ranking_date, odds_date):
             matchup_details.append({
                 "home_team": home_team,
                 "home_team_rank": home_rank,
+                "home_pitcher": home_pitcher_stats,
                 "away_team": away_team,
                 "away_team_rank": away_rank,
+                "away_pitcher": away_pitcher_stats,
                 "ranking_diff": abs(home_rank - away_rank),
                 "game_time": game["game_datetime"],
                 "odds": filter_odds_for_team(odds_data, home_team)
@@ -126,12 +150,12 @@ def check_bucket_and_return_response(request):
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(filename)
 
+    result = None
     if blob.exists():
         logging.info(f"Returning cached matchup data from GCS: {filename}")
         result = json.loads(blob.download_as_text())
     else:
-        logging.info(f"Generating new data for {schedule_date}")
-        result = check_matchups(schedule_date, ranking_date, odds_date)
+        logging.info(f"Generating matchup data for {schedule_date}")
         result = check_matchups(schedule_date, ranking_date, odds_date)
 
         if request.args.get("store", "false").lower() == "true":
@@ -144,3 +168,4 @@ def check_bucket_and_return_response(request):
         "Access-Control-Allow-Headers": "*"
     })
     return response
+
