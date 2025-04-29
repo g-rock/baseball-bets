@@ -1,17 +1,37 @@
 import functions_framework
+import firebase_admin
 import statsapi
 import requests
 import logging
 import json
 import os
 from dotenv import load_dotenv
-from datetime import date
+from datetime import date, timedelta
 from google.cloud import storage
+from firebase_admin import credentials, firestore
 from flask import jsonify, make_response
 
 load_dotenv()
 api_key = os.getenv("ODDS_API_KEY")
 logging.basicConfig(level=logging.INFO)
+
+# Firestore Initialization
+try:
+    if not firebase_admin._apps:
+        env = os.getenv("ENV")
+        if env == "LOCAL":
+            logging.warning("Initializing Firebase with local credentials")
+            cred = credentials.Certificate('service-account/bet-baseball.json')
+            firebase_admin.initialize_app(cred)
+        else:
+            logging.warning("Initializing Firebase with default cloud credentials")
+            firebase_admin.initialize_app()
+
+    db = firestore.client()
+
+except Exception as e:
+    logging.error(f"Error initializing Firestore: {e}")
+    raise
 
 def get_team_rankings(ranking_date):
     year, month, day = ranking_date.split('-')
@@ -79,6 +99,7 @@ def check_matchups(schedule_date, ranking_date, odds_date):
     matchup_details = []
 
     for game in schedule:
+        game_id = game["game_id"]
         home_team, away_team = game["home_name"], game["away_name"]
         home_probable_pitcher, away_probable_pitcher = game["home_probable_pitcher"], game["away_probable_pitcher"]
         home_pitcher_stats = get_pitcher_stats(home_probable_pitcher)
@@ -99,6 +120,7 @@ def check_matchups(schedule_date, ranking_date, odds_date):
 
         if (is_home_top and is_away_bottom) or (is_home_bottom and is_away_top):
             matchup_details.append({
+                "game_id": game_id,
                 "home_team": home_team,
                 "home_team_rank": home_rank,
                 "home_pitcher": home_pitcher_stats,
@@ -117,17 +139,43 @@ def check_matchups(schedule_date, ranking_date, odds_date):
         "matchups": sorted(matchup_details, key=lambda x: x["ranking_diff"], reverse=True)
     }
 
-def store_json_in_gcs_by_date(data, schedule_date, bucket_name="daily-baseball", folder="matchups"):
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    filename = f"{folder}/matchup_{schedule_date.replace(':', '-')}.json"
-    blob = bucket.blob(filename)
-    blob.upload_from_string(json.dumps(data, indent=2), content_type="application/json")
-    logging.info(f"Uploaded matchup data to GCS at: {filename}")
-    return f"gs://{bucket_name}/{filename}"
+def store_json_in_firestore(data, schedule_date, collection_name="matchups"):
+    doc_ref = db.collection(collection_name).document(schedule_date)
+    doc_ref.set(data)
+    logging.warning(f"Stored matchup data in Firestore at: {collection_name}/{schedule_date}")
+    return f"Firestore/{collection_name}/{schedule_date}"
+
+def update_previous_day_document(schedule_date, collection_name="matchups"):
+    previous_date = (date.fromisoformat(schedule_date) - timedelta(days=1)).isoformat()
+    doc_ref = db.collection(collection_name).document(previous_date)
+    doc = doc_ref.get()
+
+    if doc.exists:
+        data = doc.to_dict()
+        logging.warning(f"Updating previous day's document: {collection_name}/{previous_date}")
+
+        data['past_game'] = True
+
+        for matchup in data.get('matchups', []):
+            game_result = statsapi.schedule(game_id=matchup.get('game_id'))[0]
+            matchup['winning_team'] = game_result['winning_team']
+            favorited_team = matchup['home_team'] if matchup['home_team_rank'] < matchup['away_team_rank'] else matchup['away_team']
+
+            if matchup['winning_team'] == favorited_team:
+                matchup['bet_outcome'] = 'W'
+            else:
+                matchup['bet_outcome'] = 'L'
+
+
+        doc_ref.set(data)
+        logging.warning(f"Successfully updated {collection_name}/{previous_date}")
+    else:
+        logging.warning(f"No document found for previous date: {previous_date}")
+
+
 
 @functions_framework.http
-def check_bucket_and_return_response(request):
+def check_firestore_and_return_response(request):
     if request.method == "OPTIONS":
         response = make_response()
         response.headers.update({
@@ -142,24 +190,21 @@ def check_bucket_and_return_response(request):
     ranking_date = request.args.get("ranking_date") or today.isoformat()
     odds_date = request.args.get("odds_date") or today.isoformat()
 
-    bucket_name = "daily-baseball"
-    folder = "matchups"
-    filename = f"{folder}/matchup_{schedule_date}.json"
-
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(filename)
+    collection_name = "matchups"
+    doc_ref = db.collection(collection_name).document(schedule_date)
+    doc = doc_ref.get()
 
     result = None
-    if blob.exists():
-        logging.info(f"Returning cached matchup data from GCS: {filename}")
-        result = json.loads(blob.download_as_text())
+    if doc.exists:
+        logging.warning(f"Returning cached matchup data from Firestore: {collection_name}/{schedule_date}")
+        result = doc.to_dict()
     else:
-        logging.info(f"Generating matchup data for {schedule_date}")
+        logging.warning(f"Generating matchup data for {schedule_date}")
         result = check_matchups(schedule_date, ranking_date, odds_date)
 
-        if request.args.get("store", "false").lower() == "true":
-            store_json_in_gcs_by_date(result, schedule_date, bucket_name, folder)
+    if request.args.get("store", "false").lower() == "true":
+        store_json_in_firestore(result, schedule_date, collection_name)
+        update_previous_day_document(schedule_date, collection_name)
 
     response = make_response(jsonify(result))
     response.headers.update({
